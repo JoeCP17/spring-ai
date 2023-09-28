@@ -16,36 +16,36 @@
 
 package org.springframework.ai.vectorstore;
 
+import java.io.File;
+import java.time.Duration;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
 
-import javax.sql.DataSource;
-
-import com.zaxxer.hikari.HikariDataSource;
+import io.milvus.client.MilvusServiceClient;
+import io.milvus.param.ConnectParam;
+import io.milvus.param.IndexType;
+import io.milvus.param.MetricType;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.containers.DockerComposeContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import org.springframework.ai.autoconfigure.openai.OpenAiAutoConfiguration;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingClient;
-import org.springframework.ai.vectorstore.PgVectorStore.PgIndexType;
+import org.springframework.ai.vectorstore.MilvusVectorStore.MilvusVectorStoreConfig;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringBootConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
-import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
-import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Primary;
-import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.util.CollectionUtils;
+import org.springframework.util.FileSystemUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -53,13 +53,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * @author Christian Tzolov
  */
 @Testcontainers
-public class PgVectorStoreIT {
+public class MilvusVectorStoreIT {
 
-	@Container
-	static GenericContainer<?> postgresContainer = new GenericContainer<>("ankane/pgvector")
-		.withEnv("POSTGRES_USER", "postgres")
-		.withEnv("POSTGRES_PASSWORD", "postgres")
-		.withExposedPorts(5432);
+	private static DockerComposeContainer milvusContainer;
+
+	private static final File TEMP_FOLDER = new File("target/test-" + UUID.randomUUID().toString());
+
+	private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
+		.withUserConfiguration(TestApplication.class)
+		.withPropertyValues("spring.ai.openai.apiKey=" + System.getenv("OPENAI_API_KEY"));
 
 	List<Document> documents = List.of(
 			new Document("Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!!",
@@ -69,25 +71,43 @@ public class PgVectorStoreIT {
 					"Great Depression Great Depression Great Depression Great Depression Great Depression Great Depression",
 					Collections.singletonMap("meta2", "meta2")));
 
-	private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
-		.withUserConfiguration(TestApplication.class)
-		.withPropertyValues("spring.ai.openai.apiKey=" + System.getenv("OPENAI_API_KEY"),
-				"spring.ai.vectorstore.pgvector.distanceType=CosineDistance",
+	@BeforeAll
+	public static void beforeAll() {
+		FileSystemUtils.deleteRecursively(TEMP_FOLDER);
+		TEMP_FOLDER.mkdirs();
 
-				// JdbcTemplate configuration
-				String.format("app.datasource.url=jdbc:postgresql://localhost:%d/%s",
-						postgresContainer.getMappedPort(5432), "postgres"),
-				"app.datasource.username=postgres", "app.datasource.password=postgres",
-				"app.datasource.type=com.zaxxer.hikari.HikariDataSource");
+		milvusContainer = new DockerComposeContainer(new File("src/test/resources/docker-compose.yml"))
+			.withEnv("DOCKER_VOLUME_DIRECTORY", TEMP_FOLDER.getAbsolutePath())
+			.withExposedService("standalone", 19530)
+			.withExposedService("standalone", 9091,
+					Wait.forHttp("/healthz").forPort(9091).forStatusCode(200).forStatusCode(401))
+			.waitingFor("standalone", Wait.forLogMessage(".*Proxy successfully started.*\\s", 1)
+				.withStartupTimeout(Duration.ofSeconds(100)));
+		milvusContainer.start();
+	}
 
-	@ParameterizedTest
-	@ValueSource(strings = { "CosineDistance", "EuclideanDistance", "NegativeInnerProduct" })
-	public void addAndSearchTest(String distanceType) {
+	@AfterAll
+	public static void afterAll() {
+		milvusContainer.stop();
+		FileSystemUtils.deleteRecursively(TEMP_FOLDER);
+	}
+
+	private void resetCollection(VectorStore vectorStore) {
+		((MilvusVectorStore) vectorStore).dropCollection();
+		((MilvusVectorStore) vectorStore).createCollection();
+	}
+
+	@ParameterizedTest(name = "{0} : {displayName} ")
+	@ValueSource(strings = { "L2", "IP" })
+	public void addAndSearchTest(String metricType) {
+
 		contextRunner.withConfiguration(AutoConfigurations.of(OpenAiAutoConfiguration.class))
-			.withPropertyValues("spring.ai.vectorstore.pgvector.distanceType=" + distanceType)
+			.withPropertyValues("spring.ai.vectorstore.milvus.metricType=" + metricType)
 			.run(context -> {
 
 				VectorStore vectorStore = context.getBean(VectorStore.class);
+
+				resetCollection(vectorStore);
 
 				vectorStore.add(documents);
 
@@ -98,26 +118,29 @@ public class PgVectorStoreIT {
 				assertThat(resultDoc.getId()).isEqualTo(documents.get(2).getId());
 				assertThat(resultDoc.getText()).isEqualTo(
 						"Great Depression Great Depression Great Depression Great Depression Great Depression Great Depression");
-				assertThat(resultDoc.getMetadata()).containsKeys("meta2", "distance");
+				assertThat(resultDoc.getMetadata()).hasSize(2);
+				assertThat(resultDoc.getMetadata()).containsKey("meta2");
+				assertThat(resultDoc.getMetadata()).containsKey("distance");
 
 				// Remove all documents from the store
 				vectorStore.delete(documents.stream().map(doc -> doc.getId()).toList());
 
-				List<Document> results2 = vectorStore.similaritySearch("Great", 1);
+				List<Document> results2 = vectorStore.similaritySearch("Hello", 1);
 				assertThat(results2).hasSize(0);
-
 			});
 	}
 
-	@ParameterizedTest
-	@ValueSource(strings = { "CosineDistance", "EuclideanDistance", "NegativeInnerProduct" })
-	public void documentUpdateTest(String distanceType) {
+	@ParameterizedTest(name = "{0} : {displayName} ")
+	@ValueSource(strings = { "L2", "IP" })
+	public void documentUpdateTest(String metricType) {
 
 		contextRunner.withConfiguration(AutoConfigurations.of(OpenAiAutoConfiguration.class))
-			.withPropertyValues("spring.ai.vectorstore.pgvector.distanceType=" + distanceType)
+			.withPropertyValues("spring.ai.vectorstore.milvus.metricType=" + metricType)
 			.run(context -> {
 
 				VectorStore vectorStore = context.getBean(VectorStore.class);
+
+				resetCollection(vectorStore);
 
 				Document document = new Document(UUID.randomUUID().toString(), "Spring AI rocks!!",
 						Collections.singletonMap("meta1", "meta1"));
@@ -130,7 +153,8 @@ public class PgVectorStoreIT {
 				Document resultDoc = results.get(0);
 				assertThat(resultDoc.getId()).isEqualTo(document.getId());
 				assertThat(resultDoc.getText()).isEqualTo("Spring AI rocks!!");
-				assertThat(resultDoc.getMetadata()).containsKeys("meta1", "distance");
+				assertThat(resultDoc.getMetadata()).containsKey("meta1");
+				assertThat(resultDoc.getMetadata()).containsKey("distance");
 
 				Document sameIdDocument = new Document(document.getId(),
 						"The World is Big and Salvation Lurks Around the Corner",
@@ -144,19 +168,25 @@ public class PgVectorStoreIT {
 				resultDoc = results.get(0);
 				assertThat(resultDoc.getId()).isEqualTo(document.getId());
 				assertThat(resultDoc.getText()).isEqualTo("The World is Big and Salvation Lurks Around the Corner");
-				assertThat(resultDoc.getMetadata()).containsKeys("meta2", "distance");
+				assertThat(resultDoc.getMetadata()).containsKey("meta2");
+				assertThat(resultDoc.getMetadata()).containsKey("distance");
+
+				vectorStore.delete(List.of(document.getId()));
+
 			});
 	}
 
-	@ParameterizedTest
-	@ValueSource(strings = { "CosineDistance", "EuclideanDistance", "NegativeInnerProduct" })
-	public void searchThresholdTest(String distanceType) {
+	@ParameterizedTest(name = "{0} : {displayName} ")
+	@ValueSource(strings = { "L2", "IP" })
+	public void searchThresholdTest(String metricType) {
 
 		contextRunner.withConfiguration(AutoConfigurations.of(OpenAiAutoConfiguration.class))
-			.withPropertyValues("spring.ai.vectorstore.pgvector.distanceType=" + distanceType)
+			.withPropertyValues("spring.ai.vectorstore.milvus.metricType=" + metricType)
 			.run(context -> {
 
 				VectorStore vectorStore = context.getBean(VectorStore.class);
+
+				resetCollection(vectorStore);
 
 				vectorStore.add(documents);
 
@@ -166,11 +196,7 @@ public class PgVectorStoreIT {
 					.map(doc -> (Float) doc.getMetadata().get("distance"))
 					.toList();
 
-				assertThat(fullResult).hasSize(3);
-
-				assertThat(isSortedByDistance(fullResult)).isTrue();
-
-				fullResult.stream().forEach(doc -> System.out.println(doc.getMetadata().get("distance")));
+				assertThat(distances).hasSize(3);
 
 				float threshold = (distances.get(0) + distances.get(1)) / 2;
 
@@ -181,59 +207,37 @@ public class PgVectorStoreIT {
 				assertThat(resultDoc.getId()).isEqualTo(documents.get(2).getId());
 				assertThat(resultDoc.getText()).isEqualTo(
 						"Great Depression Great Depression Great Depression Great Depression Great Depression Great Depression");
-				assertThat(resultDoc.getMetadata()).containsKeys("meta2", "distance");
+				assertThat(resultDoc.getMetadata()).containsKey("meta2");
+				assertThat(resultDoc.getMetadata()).containsKey("distance");
 
 			});
-	}
-
-	private static boolean isSortedByDistance(List<Document> docs) {
-
-		List<Float> distances = docs.stream().map(doc -> (Float) doc.getMetadata().get("distance")).toList();
-
-		if (CollectionUtils.isEmpty(distances) || distances.size() == 1) {
-			return true;
-		}
-
-		Iterator<Float> iter = distances.iterator();
-		Float current, previous = iter.next();
-		while (iter.hasNext()) {
-			current = iter.next();
-			if (previous > current) {
-				return false;
-			}
-			previous = current;
-		}
-		return true;
 	}
 
 	@SpringBootConfiguration
 	@EnableAutoConfiguration(exclude = { DataSourceAutoConfiguration.class })
 	public static class TestApplication {
 
-		@Value("${spring.ai.vectorstore.pgvector.distanceType}")
-		PgVectorStore.PgDistanceType distanceType;
+		@Value("${spring.ai.vectorstore.milvus.metricType}")
+		private MetricType metricType;
 
 		@Bean
-		public VectorStore vectorStore(JdbcTemplate jdbcTemplate, EmbeddingClient embeddingClient) {
-			return new PgVectorStore(jdbcTemplate, embeddingClient, PgVectorStore.OPENAI_EMBEDDING_DIMENSION_SIZE,
-					distanceType, true, PgIndexType.HNSW);
+		public VectorStore vectorStore(MilvusServiceClient milvusClient, EmbeddingClient embeddingClient) {
+			MilvusVectorStoreConfig config = MilvusVectorStoreConfig.builder()
+				.withCollectionName("test_vector_store")
+				.withDatabaseName("default")
+				.withIndexType(IndexType.IVF_FLAT)
+				.withMetricType(metricType)
+				.withEmbeddingDimension(MilvusVectorStore.OPENAI_EMBEDDING_DIMENSION_SIZE)
+				.build();
+			return new MilvusVectorStore(milvusClient, embeddingClient, config);
 		}
 
 		@Bean
-		public JdbcTemplate myJdbcTemplate(DataSource dataSource) {
-			return new JdbcTemplate(dataSource);
-		}
-
-		@Bean
-		@Primary
-		@ConfigurationProperties("app.datasource")
-		public DataSourceProperties dataSourceProperties() {
-			return new DataSourceProperties();
-		}
-
-		@Bean
-		public HikariDataSource dataSource(DataSourceProperties dataSourceProperties) {
-			return dataSourceProperties.initializeDataSourceBuilder().type(HikariDataSource.class).build();
+		public MilvusServiceClient milvusClient() {
+			return new MilvusServiceClient(ConnectParam.newBuilder()
+				.withHost("localhost")
+				.withPort(milvusContainer.getServicePort("standalone", 19530))
+				.build());
 		}
 
 	}
